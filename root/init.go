@@ -296,6 +296,11 @@ check-interval = "24h"
 # 0 = off (default, notify only), 1 = auto-install, 2 = always confirm first
 auto-update = 0
 
+[zoxide]
+# also complete cd from zoxide's frecency database, not just the
+# children of the current directory (requires zoxide on PATH)
+extend-cd = false
+
 [keybindings]
 toggle-mode = "ctrl+r"
 toggle-menu = "shift+tab"

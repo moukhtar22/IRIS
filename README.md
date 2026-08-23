@@ -330,6 +330,9 @@ channel = "stable"       # "stable" or "nightly"
 check-interval = "24h"   # min time between update checks
 auto-update = 0          # 0 = off, 1 = auto-install, 2 = confirm first
 
+[zoxide]
+extend-cd = false  # complete `cd` from zoxide's database, not just the current directory
+
 [ai]
 enabled = false
 provider = "groq"  # "groq" or "ollama"
