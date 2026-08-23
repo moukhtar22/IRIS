@@ -15,6 +15,7 @@ func DefaultConfig() *Config {
 			ExpandAlias:       true,
 			AutoExecute:       false,
 			CobraProbeEnabled: true,
+			NavigateClosed:    "history",
 		},
 		UI: UIConfig{
 			Style:           "modern",
@@ -56,7 +57,6 @@ func DefaultConfig() *Config {
 			SelectSuggestion: "tab",
 			NavigateUp:       "up",
 			NavigateDown:     "down",
-			NavigateClosed:   "history",
 		},
 	}
 }

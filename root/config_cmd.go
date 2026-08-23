@@ -68,6 +68,10 @@ atuin-db-path = ""
 # probe unknown binaries with ` + "`__complete`" + ` for Cobra-based CLI suggestions.
 cobra-probe-enabled = true
 
+# what navigate-up/navigate-down do while the menu is closed:
+# "history" = browse iris history, "shell" = leave the key to the shell (e.g. atuin)
+navigate-closed = "history"
+
 [ui]
 # visual style: "modern" (icons, category pills, shortcut footer) or "classic" (minimalist, centered number, no icons)
 style = "modern"
@@ -124,9 +128,6 @@ navigate-up = "up"
 navigate-down = "down"
 navigate-right = "right"
 
-# what navigate-up/navigate-down do while the menu is closed:
-# "history" = browse iris history, "shell" = leave the key to the shell
-navigate-closed = "history"
 `
 		err = os.WriteFile(path, []byte(defaultContent), 0644)
 		if err != nil {

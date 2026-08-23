@@ -921,7 +921,7 @@ func runWrapper() {
 				// navigate-closed = "shell" leaves the key to the shell while the
 				// menu is closed -- atuin binds Up, and claiming it here is what
 				// forces the navigate keys off the arrows entirely.
-				navToShell := !overlay.IsVisible() && config.Get().Keybindings.NavigateClosed == "shell"
+				navToShell := !overlay.IsVisible() && config.Get().Core.NavigateClosed == "shell"
 				if (isNavUp || isNavDown) && !navToShell {
 					arrowDir := "down"
 					if isNavUp {

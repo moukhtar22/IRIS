@@ -302,6 +302,7 @@ auto-execute = false           # run suggestion immediately instead of inserting
 atuin-history = 0              # 0 = shell history, 1 = atuin, 2 = both
 atuin-db-path = ""             # path to atuin's history.db, empty = use default
 cobra-probe-enabled = true     # fall back to probing cobra binaries for completions
+navigate-closed = "history"    # menu closed: "history" browses iris history, "shell" hands the key to the shell (atuin)
 
 [ui]
 style = "modern"       # "modern" or "classic"
@@ -319,7 +320,6 @@ select = "tab"             # accept the selected suggestion
 navigate-up = "up"         # select up, or open history if empty
 navigate-down = "down"     # select down, or open history if empty
 navigate-right = "right"   # accept ghost text
-navigate-closed = "history" # with the menu closed: "history" browses iris history, "shell" passes the key to the shell (e.g. atuin)
 
 [git]
 filter-active-branch = true  # exclude current branch from suggestions

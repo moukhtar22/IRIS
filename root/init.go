@@ -253,6 +253,10 @@ expand-alias = true
 # automatically execute command after accepting suggestion
 auto-execute = false
 
+# what navigate-up/navigate-down do while the menu is closed:
+# "history" = browse iris history, "shell" = leave the key to the shell (e.g. atuin)
+navigate-closed = "history"
+
 [ui]
 # visual style: "modern" (icons, category pills, shortcut footer) or "classic" (minimalist, centered number, no icons)
 style = "modern"
@@ -309,9 +313,6 @@ navigate-up = "up"
 navigate-down = "down"
 navigate-right = "right"
 
-# what navigate-up/navigate-down do while the menu is closed:
-# "history" = browse iris history, "shell" = leave the key to the shell
-navigate-closed = "history"
 `
 				if errWrite := os.WriteFile(path, []byte(defaultContent), 0644); errWrite == nil {
 					fmt.Printf("✓ Initialized default config file at %s\n", path)
