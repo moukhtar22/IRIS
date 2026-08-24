@@ -161,15 +161,16 @@ func TestRenderMatchedTitle_CaseInsensitive(t *testing.T) {
 }
 
 func TestMenuItemRowsHonorsMaxHeight(t *testing.T) {
-	// ui.max-height was parsed and validated but never read: the box was fixed
-	// at 6 rows however it was configured, unlike ui.max-width.
+	// ui.max-height counts suggestion rows. It was read as the height of the
+	// whole box for a while, so a configured 6 drew 4 rows.
 	tests := []struct {
 		name      string
 		maxHeight int
 		want      int
 	}{
-		{"configured", 15, 15 - borderLines},
-		{"minimum", 3, 1},
+		{"configured", 15, 15},
+		{"borders do not eat rows", 6, 6},
+		{"minimum", 1, 1},
 		{"zero falls back", 0, defaultMaxItems},
 		{"out of range falls back", 999, defaultMaxItems},
 	}
@@ -209,7 +210,7 @@ func TestScrolloffIsSymmetric(t *testing.T) {
 	// The window kept a row of context above the highlight but none below, so
 	// paging down pinned it to the last visible row while paging up did not.
 	cfg := config.DefaultConfig()
-	cfg.UI.MaxHeight = 8 // 6 item rows
+	cfg.UI.MaxHeight = 6
 	config.Init(cfg)
 
 	items := make([]spec.Suggestion, 20)
@@ -237,5 +238,100 @@ func TestScrolloffIsSymmetric(t *testing.T) {
 		if o.Cursor > 0 && o.Cursor == o.StartIdx {
 			t.Fatalf("moving up: cursor %d pinned to first visible row (start %d, window %d)", o.Cursor, o.StartIdx, window)
 		}
+	}
+}
+
+func TestInputRowsCountsWrappedRows(t *testing.T) {
+	// termWidth() falls back to 120 when stdout is not a TTY
+	tests := []struct {
+		totalCol int
+		want     int
+	}{
+		{0, 0},
+		{119, 0},
+		{120, 1},
+		{300, 2},
+	}
+
+	for _, tt := range tests {
+		if got := inputRows(tt.totalCol); got != tt.want {
+			t.Errorf("inputRows(%d) = %d; want %d", tt.totalCol, got, tt.want)
+		}
+	}
+}
+
+func wrappedOverlay(t *testing.T, promptLen int) (*Overlay, string) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	config.Init(cfg)
+
+	items := make([]spec.Suggestion, 10)
+	for i := range items {
+		items[i] = spec.Suggestion{Cmd: string(rune('a' + i))}
+	}
+
+	o := NewOverlay()
+	o.SetQueryAndItems("q", items)
+	o.SetPromptLen(promptLen)
+	return o, o.Render()
+}
+
+func TestDrawErasesRowsLeftBehindWhenInputStopsWrapping(t *testing.T) {
+	// The box hangs off the cursor. A command long enough to wrap pushes the
+	// cursor down, so the box sits lower; when the line shrinks back the cursor
+	// moves up and the rows the old box occupied were left on screen.
+	o, _ := wrappedOverlay(t, 250) // two wrapped rows
+
+	o.SetPromptLen(10) // back to a single row
+	out := o.Render()
+
+	totalLines := min(len(o.Items), menuItemRows()) + borderLines
+	for _, extra := range []int{1, 2} {
+		want := ansi.CursorDown(totalLines + extra)
+		if !strings.Contains(out, want) {
+			t.Errorf("redraw does not erase row %d below the box (missing %q)", extra, want)
+		}
+	}
+}
+
+func TestDrawErasesTheStaleTopBorderWhenInputGrows(t *testing.T) {
+	// The other direction: the input wraps onto the row the previous top border
+	// was on. The shell repaints only as far as the text reaches, so the tail of
+	// the old border survives to its right.
+	o, _ := wrappedOverlay(t, 10)
+
+	o.SetPromptLen(250)
+	out := o.Render()
+
+	if !strings.Contains(out, ansi.EraseLineRight) {
+		t.Errorf("redraw does not erase the stale border to the right of the wrapped input: %q", out)
+	}
+}
+
+func TestClearCoversABoxDrawnUnderWrappedInput(t *testing.T) {
+	o, _ := wrappedOverlay(t, 250)
+
+	rows := clearRows()
+	if want := min(len(o.Items), menuItemRows()) + borderLines + 2; rows != want {
+		t.Errorf("clearRows() = %d; want %d (the box plus the two rows it hangs below the cursor)", rows, want)
+	}
+
+	o.ClearAndDisable()
+	if got := lastDrawnInputRows.Load(); got != 0 {
+		t.Errorf("lastDrawnInputRows after teardown = %d; want 0", got)
+	}
+}
+
+func TestDrawLeavesTheLineAloneWhenTheCursorIsNotAtTheEnd(t *testing.T) {
+	// The erase walks to the end-of-text column, so with the cursor moved back
+	// into the middle of the command it would land mid-text and wipe it.
+	o, _ := wrappedOverlay(t, 10)
+
+	o.SetCursorAtEnd(false)
+	o.SetPromptLen(250)
+	out := o.Render()
+
+	if strings.Contains(out, ansi.EraseLineRight) {
+		t.Error("redraw erased to end of line while the cursor was mid-command")
 	}
 }

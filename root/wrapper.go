@@ -156,6 +156,11 @@ func menuOnlyHidden(mode config.GhostTextMode, menuEnabled bool) bool {
 	return !menuEnabled && mode == config.GhostTextIndividual
 }
 
+// repaintSettleDelay is how long the pty has to stay quiet before a deferred
+// overlay draw runs. Long enough to cover a shell repaint arriving in several
+// chunks, short enough that navigation still feels immediate.
+const repaintSettleDelay = 12 * time.Millisecond
+
 // runWrapper sets up the pty environment, launches the shell,
 // and manages the main input loop to provide real-time suggestions
 // it handles raw terminal mode to intercept keystrokes and
@@ -358,14 +363,49 @@ func runWrapper() {
 			renderer()
 		}
 	})
+	// A line rewrite reaches the terminal through the shell: iris writes the
+	// replacement to the pty, the shell repaints, and only then does the cursor
+	// sit on the row the box has to hang off. Drawing straight away anchors the
+	// box at the old row, and a line that grew onto more wrapped rows repaints
+	// over the top of it.
+	var deferredDrawMu sync.Mutex
+	var deferredDrawTimer *time.Timer
+	var deferredDraw func()
+
+	// drawAfterRepaint runs draw once the pty has been quiet for a moment,
+	// which is as close as iris gets to "the shell has finished repainting".
+	drawAfterRepaint := func(draw func()) {
+		deferredDrawMu.Lock()
+		defer deferredDrawMu.Unlock()
+		deferredDraw = draw
+		if deferredDrawTimer != nil {
+			deferredDrawTimer.Stop()
+		}
+		deferredDrawTimer = time.AfterFunc(repaintSettleDelay, func() {
+			deferredDrawMu.Lock()
+			run := deferredDraw
+			deferredDraw = nil
+			deferredDrawTimer = nil
+			deferredDrawMu.Unlock()
+			if run != nil {
+				run()
+			}
+		})
+	}
+
+	// postponeDeferredDraw pushes the pending draw back while the shell is
+	// still writing, so the box lands after the last of the repaint.
+	postponeDeferredDraw := func() {
+		deferredDrawMu.Lock()
+		defer deferredDrawMu.Unlock()
+		if deferredDrawTimer != nil {
+			deferredDrawTimer.Reset(repaintSettleDelay)
+		}
+	}
+
 	isExecuting := func() bool {
 		if isAltScreenActive.Load() {
-			pgrp, pgrpErr := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPGRP)
-			if pgrpErr == nil && pgrp == shellPGID {
-				isAltScreenActive.Store(false)
-			} else {
-				return true
-			}
+			return true
 		}
 		if isCommandActive.Load() {
 			// for bash: no preexec/precmd hooks, so fall back to TIOCGPGRP to detect when shell returns
@@ -411,8 +451,8 @@ func runWrapper() {
 			var toWrite []byte
 			if isHistMode && selectedCmd != "" {
 				naiveBuffer = selectedCmd
+				toWrite = shell.ReplaceLine([]byte(selectedCmd), cursorOffset)
 				cursorOffset = 0
-				toWrite = shell.ReplaceLine([]byte(selectedCmd))
 			}
 			bufCopy := naiveBuffer
 			offsetCopy := cursorOffset
@@ -425,13 +465,21 @@ func runWrapper() {
 			// ghost text is derived from TypedQuery, so history navigation that
 			// rewrites the buffer must move it too or the hint lags a selection
 			overlay.SetTypedQuery(bufCopy)
+			overlay.SetCursorAtEnd(offsetCopy == 0)
 
-			var b strings.Builder
-			if !disableGhostText.Load() {
-				b.WriteString(overlay.RenderGhostText(bufCopy, true, offsetCopy == 0))
+			draw := func() {
+				var b strings.Builder
+				if !disableGhostText.Load() {
+					b.WriteString(overlay.RenderGhostText(bufCopy, true, offsetCopy == 0))
+				}
+				b.WriteString(overlay.Render())
+				writeStdout([]byte(b.String()))
 			}
-			b.WriteString(overlay.Render())
-			writeStdout([]byte(b.String()))
+			if len(toWrite) > 0 {
+				drawAfterRepaint(draw)
+			} else {
+				draw()
+			}
 		} else if suggestionsEnabled {
 			// hidden-overlay history navigation only when suggestions are enabled;
 			// otherwise let the navigation keys pass through to the shell
@@ -471,12 +519,13 @@ func runWrapper() {
 				if selected != "" {
 					bufferMu.Lock()
 					naiveBuffer = selected
+					replace := shell.ReplaceLine([]byte(selected), cursorOffset)
 					cursorOffset = 0
 					bufferMu.Unlock()
 
 					userNavigated.Store(true)
 					writeStdout([]byte(overlay.Render()))
-					_, _ = ptmx.Write(shell.ReplaceLine([]byte(selected)))
+					_, _ = ptmx.Write(replace)
 				}
 			}
 		}
@@ -494,6 +543,7 @@ func runWrapper() {
 			}
 		}()
 		var lastPromptBuf []byte
+		var altScreenCarry []byte
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
@@ -508,14 +558,16 @@ func runWrapper() {
 
 			// detect alternate screen buffer (smcup/rmcup) used by TUI apps (nvim, atuin, fzf)
 			chunk := buf[:n]
-			if bytes.Contains(chunk, []byte("\x1b[?1049h")) || bytes.Contains(chunk, []byte("\x1b[?1047h")) || bytes.Contains(chunk, []byte("\x1b[?47h")) {
-				isAltScreenActive.Store(true)
-				writeStdout([]byte(overlay.ClearAndDisable()))
-			} else if bytes.Contains(chunk, []byte("\x1b[?1049l")) || bytes.Contains(chunk, []byte("\x1b[?1047l")) || bytes.Contains(chunk, []byte("\x1b[?47l")) {
-				isAltScreenActive.Store(false)
+			if enter, ok := scanAltScreen(altScreenCarry, chunk); ok {
+				isAltScreenActive.Store(enter)
+				if enter {
+					writeStdout([]byte(overlay.ClearAndDisable()))
+				}
 			}
+			altScreenCarry = keepAltScreenCarry(chunk)
 
 			writeStdout(chunk)
+			postponeDeferredDraw()
 
 			bufferMu.Lock()
 			nbEmpty := naiveBuffer == ""
@@ -582,6 +634,9 @@ func runWrapper() {
 					}
 				}
 				isCommandActive.Store(false)
+				// the shell reached a new prompt, so nothing owns the alternate
+				// screen any more even if a killed TUI never restored it
+				isAltScreenActive.Store(false)
 				SetCurrentAISuggestion(nil)
 				bufferMu.Lock()
 				cmdToRecord := lastSubmittedCommand
@@ -633,6 +688,9 @@ func runWrapper() {
 			}
 
 			isCommandActive.Store(false)
+			// a query means the shell's line editor is live, so any full screen
+			// app launched from a widget (atuin, fzf) has handed the screen back
+			isAltScreenActive.Store(false)
 
 			if overlay.GetUserNavigated() {
 				continue
@@ -793,6 +851,7 @@ func runWrapper() {
 		}
 
 		overlay.SetUserNavigated(navCopy)
+		overlay.SetCursorAtEnd(offsetCopy == 0)
 		if !disableGhostText.Load() {
 			b.WriteString(overlay.RenderGhostText(bufCopy, navCopy, offsetCopy == 0))
 		}
@@ -902,9 +961,10 @@ func runWrapper() {
 					if userNavigated.Load() {
 						bufferMu.Lock()
 						naiveBuffer = overlay.GetTypedQuery()
+						replace := shell.ReplaceLine([]byte(overlay.GetTypedQuery()), cursorOffset)
 						cursorOffset = 0
 						bufferMu.Unlock()
-						_, _ = ptmx.Write(shell.ReplaceLine([]byte(overlay.GetTypedQuery())))
+						_, _ = ptmx.Write(replace)
 					}
 					userNavigated.Store(false)
 					overlay.Show()
@@ -950,9 +1010,10 @@ func runWrapper() {
 							}
 							bufferMu.Lock()
 							naiveBuffer = selected
+							replace := shell.ReplaceLine([]byte(selected), cursorOffset)
 							cursorOffset = 0
 							bufferMu.Unlock()
-							_, _ = ptmx.Write(shell.ReplaceLine([]byte(selected)))
+							_, _ = ptmx.Write(replace)
 
 							overlay.ClearGhostTextState()
 							userNavigated.Store(false)
@@ -1001,8 +1062,11 @@ func runWrapper() {
 								selectedCmd = s + " "
 							}
 						}
+						bufferMu.Lock()
+						offset := cursorOffset
+						bufferMu.Unlock()
 						// update the line first
-						_, _ = ptmx.Write(shell.ReplaceLine([]byte(selectedCmd)))
+						_, _ = ptmx.Write(shell.ReplaceLine([]byte(selectedCmd), offset))
 						cmdToSubmit = selectedCmd
 					} else {
 						bufferMu.Lock()
@@ -1016,11 +1080,12 @@ func runWrapper() {
 							disableGhostText.Store(newCfg.UI.GhostText == config.GhostTextOff)
 						}
 						msg := "echo -e '\\033[32m✓ Iris configuration reloaded successfully.\\033[0m'\r"
-						_, _ = ptmx.Write(shell.ReplaceLine([]byte(msg)))
 						bufferMu.Lock()
+						replace := shell.ReplaceLine([]byte(msg), cursorOffset)
 						naiveBuffer = ""
 						cursorOffset = 0
 						bufferMu.Unlock()
+						_, _ = ptmx.Write(replace)
 						activeModeMu.Lock()
 						activeMode = loadMode()
 						activeModeMu.Unlock()
@@ -1308,12 +1373,13 @@ func runWrapper() {
 							bufferMu.Unlock()
 
 							if isSpaceAlias && ok {
-								// clear the current alias and replace it with the full command
-								_, _ = ptmx.Write(shell.ReplaceLine([]byte(target + " ")))
 								bufferMu.Lock()
+								replace := shell.ReplaceLine([]byte(target+" "), cursorOffset)
 								naiveBuffer = target + " "
 								cursorOffset = 0
 								bufferMu.Unlock()
+								// clear the current alias and replace it with the full command
+								_, _ = ptmx.Write(replace)
 								shouldOverlayDraw = true
 								continue
 							}

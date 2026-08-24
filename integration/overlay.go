@@ -23,6 +23,9 @@ const (
 	defaultMaxItems = 6
 	// borderLines is the top and bottom border the box draws around its items.
 	borderLines = 2
+	// maxMenuItems is the largest ui.max-height accepted, mirroring the bound
+	// config validation enforces.
+	maxMenuItems = 50
 )
 
 // lastDrawnLines records the total height of the most recently drawn box, so a
@@ -31,26 +34,42 @@ const (
 // leave the surplus rows on screen.
 var lastDrawnLines atomic.Int32
 
+// lastDrawnInputRows records how many rows the prompt plus the typed text
+// wrapped onto when the box was last drawn. The box hangs off the cursor, so
+// when that count changes the whole box moves with it and the terminal keeps
+// whatever the new one no longer covers.
+var lastDrawnInputRows atomic.Int32
+
+// inputRows is how many rows past the first the prompt and typed text occupy.
+func inputRows(totalCol int) int {
+	w := termWidth()
+	if w <= 0 {
+		return 0
+	}
+	return totalCol / w
+}
+
 // menuItemRows is how many suggestion rows the overlay may show.
 //
-// ui.max-height is the height of the whole box, matching its name and the
-// comment `iris config init` writes, so the borders come out of that budget.
-// It is also clamped to the terminal: a box taller than the window can't be
-// scrolled back into view and would push the prompt off screen.
+// ui.max-height counts suggestions, not the lines the box occupies: it is the
+// number people compare against what they can see, and counting the border
+// into it meant max-height = 6 drew 4 rows.
+// It is still clamped to the terminal, since a box taller than the window
+// can't be scrolled back into view and would push the prompt off screen.
 func menuItemRows() int {
 	rows := config.Get().UI.MaxHeight
-	if rows < 3 || rows > 50 {
-		rows = defaultMaxItems + borderLines
+	if rows < 1 || rows > maxMenuItems {
+		rows = defaultMaxItems
 	}
 
 	if h := termHeight(); h > 0 {
-		// Leave a row for the prompt itself plus one of breathing room.
-		if avail := h - 2; rows > avail {
+		// Leave room for the border, the prompt itself, and one row of
+		// breathing room.
+		if avail := h - borderLines - 2; rows > avail {
 			rows = avail
 		}
 	}
 
-	rows -= borderLines
 	if rows < 1 {
 		rows = 1
 	}
@@ -58,13 +77,15 @@ func menuItemRows() int {
 }
 
 // clearRows is the number of lines a clear must erase: whatever is on screen
-// now, which may be taller than what the next draw will produce.
+// now, which may be taller than what the next draw will produce, plus the rows
+// a box drawn against a wrapped input reached further down than the cursor
+// sits today.
 func clearRows() int {
 	n := int(lastDrawnLines.Load())
 	if want := menuItemRows() + borderLines; want > n {
 		n = want
 	}
-	return n
+	return n + int(lastDrawnInputRows.Load())
 }
 
 func ComputeCursorCol(data []byte) int {
@@ -185,6 +206,16 @@ type Overlay struct {
 	TypedQuery    string
 	UserNavigated bool
 	PromptLen     int
+	// CursorAtEnd gates the erase that follows the input onto a new wrapped
+	// row: it walks to the end-of-text column, which is only where the cursor
+	// really is when nothing has moved it left.
+	CursorAtEnd bool
+}
+
+func (o *Overlay) SetCursorAtEnd(v bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.CursorAtEnd = v
 }
 
 func (o *Overlay) SetPromptLen(l int) {
@@ -197,7 +228,7 @@ func (o *Overlay) SetPromptLen(l int) {
 }
 
 func NewOverlay() *Overlay {
-	return &Overlay{Visible: false, Cursor: 0, StartIdx: 0}
+	return &Overlay{Visible: false, Cursor: 0, StartIdx: 0, CursorAtEnd: true}
 }
 
 func (o *Overlay) UpdateItems(items []spec.Suggestion) {
@@ -635,6 +666,26 @@ func (o *Overlay) draw() string {
 	}
 	logger.Debugf("Overlay draw: pLen=%d, typedLen=%d, totalCol=%d, cursorCol=%d, targetCol=%d, width=%d", o.PromptLen, typedLen, totalCol, cursorCol, targetCol, width)
 
+	// The box is placed relative to the cursor, so a change in how many rows the
+	// input wraps onto moves it. Whatever the previous box covered and this one
+	// will not has to be erased by hand; the shell only repaints the input.
+	rowsNow := inputRows(totalCol)
+	wrapShift := int(lastDrawnInputRows.Load()) - rowsNow
+	lastDrawnInputRows.Store(int32(rowsNow))
+
+	if wrapShift < 0 && o.CursorAtEnd {
+		// the input grew onto the row the old top border was on, and the shell
+		// redraw stops where the text stops. Start past the ghost text so the
+		// hint written just before this survives.
+		s.WriteString(ansi.SaveCursor)
+		s.WriteString("\r")
+		if from := cursorCol + o.LastGhostLen; from > 0 {
+			s.WriteString(ansi.CursorForward(from))
+		}
+		s.WriteString(ansi.EraseLineRight)
+		s.WriteString(ansi.RestoreCursor)
+	}
+
 	s.WriteString(ansi.SaveCursor)
 
 	windowSize := min(len(o.Items), menuItemRows())
@@ -843,6 +894,13 @@ func (o *Overlay) draw() string {
 
 	s.WriteString(titledEdge("╰", "╯", inner, footerInfo, border, inner-lipgloss.Width(footerInfo)-2))
 
+	// the previous box sat lower down; erase the rows this one leaves behind
+	for i := range wrapShift {
+		s.WriteString(ansi.RestoreCursor)
+		s.WriteString(ansi.CursorDown(totalLines + i + 1))
+		s.WriteString("\r" + ansi.EraseEntireLine)
+	}
+
 	s.WriteString(ansi.RestoreCursor)
 	s.WriteString(ansi.SetModeAutoWrap)
 	return s.String()
@@ -897,6 +955,8 @@ func (o *Overlay) HideMenu(query string) string {
 	}
 
 	clearLinesBelow(&s, clearRows())
+	// the box is gone, so nothing is hanging below a wrapped input any more
+	lastDrawnInputRows.Store(0)
 	s.WriteString(ansi.SetModeAutoWrap)
 	return s.String()
 }
@@ -927,6 +987,8 @@ func (o *Overlay) ClearAndDisable() string {
 	}
 
 	clearLinesBelow(&s, clearRows())
+	// the box is gone, so nothing is hanging below a wrapped input any more
+	lastDrawnInputRows.Store(0)
 	s.WriteString(ansi.SetModeAutoWrap)
 	return s.String()
 }
