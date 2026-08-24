@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/creack/pty"
 	"github.com/versenilvis/iris/integration"
 	"github.com/versenilvis/iris/integration/shell"
@@ -160,6 +161,32 @@ func menuOnlyHidden(mode config.GhostTextMode, menuEnabled bool) bool {
 // overlay draw runs. Long enough to cover a shell repaint arriving in several
 // chunks, short enough that navigation still feels immediate.
 const repaintSettleDelay = 12 * time.Millisecond
+
+// maxRepaintWait caps how long a deferred draw can be pushed back in total. It
+// is generous because it only ever applies when the replacement moves the box:
+// a menu that appears late is a blink, but one drawn into a line the shell is
+// still painting corrupts it for good. The shell repaints incrementally and
+// will not repair cells it does not know were overwritten.
+const maxRepaintWait = 150 * time.Millisecond
+
+// echoMarkerLen is how much of the tail of a replaced line iris looks for in
+// the shell's output to know the repaint reached the end.
+const echoMarkerLen = 12
+
+// echoSettleDelay is the short window kept after the echo is seen, for the tail
+// of the repaint.
+const echoSettleDelay = 5 * time.Millisecond
+
+// echoMarker is the tail of text that its echo must contain. Escape sequences
+// are stripped from the shell's output before matching, so highlighting that
+// splits the line into coloured runs does not hide it.
+func echoMarker(text string) []byte {
+	stripped := ansi.Strip(text)
+	if r := []rune(stripped); len(r) > echoMarkerLen {
+		stripped = string(r[len(r)-echoMarkerLen:])
+	}
+	return []byte(stripped)
+}
 
 // runWrapper sets up the pty environment, launches the shell,
 // and manages the main input loop to provide real-time suggestions
@@ -371,6 +398,8 @@ func runWrapper() {
 	var deferredDrawMu sync.Mutex
 	var deferredDrawTimer *time.Timer
 	var deferredDraw func()
+	var deferredDrawDeadline time.Time
+	var deferredEchoSeen bool
 
 	// drawAfterRepaint runs draw once the pty has been quiet for a moment,
 	// which is as close as iris gets to "the shell has finished repainting".
@@ -378,6 +407,8 @@ func runWrapper() {
 		deferredDrawMu.Lock()
 		defer deferredDrawMu.Unlock()
 		deferredDraw = draw
+		deferredEchoSeen = false
+		deferredDrawDeadline = time.Now().Add(maxRepaintWait)
 		if deferredDrawTimer != nil {
 			deferredDrawTimer.Stop()
 		}
@@ -393,12 +424,70 @@ func runWrapper() {
 		})
 	}
 
+	// hastenDeferredDraw brings the pending draw forward once the shell has
+	// echoed the line back. A short window still follows, for the tail of the
+	// repaint, but nothing may extend it again -- that extending is what turned
+	// the wait into the frame rate.
+	hastenDeferredDraw := func() {
+		deferredDrawMu.Lock()
+		defer deferredDrawMu.Unlock()
+		deferredEchoSeen = true
+		if deferredDrawTimer != nil {
+			deferredDrawTimer.Reset(echoSettleDelay)
+		}
+	}
+
+	// drawAfterEcho holds a draw until the shell has echoed back the tail of
+	// the line iris just told it to display. That is a fact about this specific
+	// repaint, so navigation stays at full rate however slowly the terminal
+	// drains -- unlike waiting for the pty to fall quiet, which never happens
+	// while a key is held.
+	var echoMu sync.Mutex
+	var echoWant []byte
+	var echoSeen []byte
+
+	drawAfterEcho := func(want []byte, draw func()) {
+		echoMu.Lock()
+		echoWant = want
+		echoSeen = echoSeen[:0]
+		echoMu.Unlock()
+		// the timer stays armed as a backstop, in case the echo never arrives
+		// in a form iris recognises
+		drawAfterRepaint(draw)
+	}
+
+	// noteEcho feeds shell output to the pending draw's marker.
+	noteEcho := func(chunk []byte) {
+		echoMu.Lock()
+		if echoWant == nil {
+			echoMu.Unlock()
+			return
+		}
+		echoSeen = append(echoSeen, []byte(ansi.Strip(string(chunk)))...)
+		if keep := len(echoWant) * 8; len(echoSeen) > keep {
+			echoSeen = append(echoSeen[:0], echoSeen[len(echoSeen)-keep:]...)
+		}
+		if !bytes.Contains(echoSeen, echoWant) {
+			echoMu.Unlock()
+			return
+		}
+		echoWant = nil
+		echoSeen = echoSeen[:0]
+		echoMu.Unlock()
+		hastenDeferredDraw()
+	}
+
 	// postponeDeferredDraw pushes the pending draw back while the shell is
 	// still writing, so the box lands after the last of the repaint.
 	postponeDeferredDraw := func() {
 		deferredDrawMu.Lock()
 		defer deferredDrawMu.Unlock()
-		if deferredDrawTimer != nil {
+		// never past the deadline: a command that keeps writing must not hold
+		// the menu back indefinitely
+		if deferredEchoSeen {
+			return
+		}
+		if deferredDrawTimer != nil && time.Now().Add(repaintSettleDelay).Before(deferredDrawDeadline) {
 			deferredDrawTimer.Reset(repaintSettleDelay)
 		}
 	}
@@ -458,13 +547,11 @@ func runWrapper() {
 			offsetCopy := cursorOffset
 			bufferMu.Unlock()
 
-			if len(toWrite) > 0 {
-				_, _ = ptmx.Write(toWrite)
-			}
-
 			// ghost text is derived from TypedQuery, so history navigation that
 			// rewrites the buffer must move it too or the hint lags a selection
-			overlay.SetTypedQuery(bufCopy)
+			// the highlight moves now, but the shell's line only catches up
+			// when the held-back rewrite lands
+			overlay.SetSelection(bufCopy)
 			overlay.SetCursorAtEnd(offsetCopy == 0)
 
 			draw := func() {
@@ -476,7 +563,13 @@ func runWrapper() {
 				writeStdout([]byte(b.String()))
 			}
 			if len(toWrite) > 0 {
-				drawAfterRepaint(draw)
+				_, _ = ptmx.Write(toWrite)
+				overlay.SetScreenLine(bufCopy)
+				// Wait for the shell to echo this line back rather than for the
+				// pty to fall quiet. Under continuous navigation it never falls
+				// quiet, so the quiet-based wait always ran out its cap and
+				// that cap became the frame rate.
+				drawAfterEcho(echoMarker(bufCopy), draw)
 			} else {
 				draw()
 			}
@@ -566,8 +659,14 @@ func runWrapper() {
 			}
 			altScreenCarry = keepAltScreenCarry(chunk)
 
-			writeStdout(chunk)
+			// Push the pending draw back before writing, not after: stdout is
+			// the terminal (tmux, and whatever renders it), so this write can
+			// block for as long as that side is slow to consume. Postponing
+			// afterwards lets the settle timer expire mid-repaint, and the box
+			// then lands in the middle of a line the shell is still painting.
 			postponeDeferredDraw()
+			writeStdout(chunk)
+			noteEcho(chunk)
 
 			bufferMu.Lock()
 			nbEmpty := naiveBuffer == ""

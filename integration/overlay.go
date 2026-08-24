@@ -210,6 +210,30 @@ type Overlay struct {
 	// row: it walks to the end-of-text column, which is only where the cursor
 	// really is when nothing has moved it left.
 	CursorAtEnd bool
+	// anchorCol pins the box's column for as long as the user is walking the
+	// list. Selecting an entry rewrites the line, so following the cursor makes
+	// the box jump left and right under the entry being read.
+	anchorCol int
+	hasAnchor bool
+	// ScreenLine is what iris believes the shell is currently displaying. It
+	// trails TypedQuery while a rewrite is held back during navigation, and the
+	// box is placed against this, not against the entry being highlighted.
+	ScreenLine string
+}
+
+// SetSelection updates the highlighted entry without claiming the shell has
+// redrawn its line yet.
+func (o *Overlay) SetSelection(q string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.TypedQuery = q
+}
+
+// SetScreenLine records that the shell's line now holds q.
+func (o *Overlay) SetScreenLine(q string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ScreenLine = q
 }
 
 func (o *Overlay) SetCursorAtEnd(v bool) {
@@ -268,6 +292,7 @@ func (o *Overlay) SetTypedQuery(q string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.TypedQuery = q
+	o.ScreenLine = q
 }
 
 func (o *Overlay) GetCurrentCmd() string {
@@ -305,11 +330,13 @@ func (o *Overlay) SetQueryAndItems(query string, items []spec.Suggestion) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.TypedQuery = query
+	o.ScreenLine = query
 	o.UserNavigated = false
 	o.Items = items
 	o.Visible = len(o.Items) > 0
 	o.Cursor = 0
 	o.StartIdx = 0
+	o.hasAnchor = false
 }
 
 func (o *Overlay) InjectAISuggestion(sugg spec.Suggestion) bool {
@@ -398,7 +425,9 @@ func (o *Overlay) SetHistoryList(items []spec.Suggestion, startAtBottom bool) st
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.TypedQuery = ""
+	o.ScreenLine = ""
 	o.UserNavigated = true
+	o.hasAnchor = false
 	o.Items = items
 	o.Visible = len(o.Items) > 0
 	if startAtBottom && len(o.Items) > 0 {
@@ -630,7 +659,7 @@ func (o *Overlay) draw() string {
 	var s strings.Builder
 	s.WriteString(ansi.ResetModeAutoWrap)
 
-	typedLen := lipgloss.Width(o.TypedQuery)
+	typedLen := lipgloss.Width(o.ScreenLine)
 	width := termWidth()
 
 	// ComputeCursorCol returns the total visual width, not the column on the
@@ -663,6 +692,15 @@ func (o *Overlay) draw() string {
 	}
 	if targetCol < 0 {
 		targetCol = 0
+	}
+	// Hold the column still while the user walks the list. Each step rewrites
+	// the shell's line to the selected entry, so the cursor -- and with it the
+	// box -- would otherwise jump to a new column on every keypress.
+	if o.UserNavigated && o.hasAnchor {
+		targetCol = o.anchorCol
+	} else {
+		o.anchorCol = targetCol
+		o.hasAnchor = true
 	}
 	logger.Debugf("Overlay draw: pLen=%d, typedLen=%d, totalCol=%d, cursorCol=%d, targetCol=%d, width=%d", o.PromptLen, typedLen, totalCol, cursorCol, targetCol, width)
 
@@ -934,6 +972,7 @@ func (o *Overlay) HideMenu(query string) string {
 	defer o.mu.Unlock()
 
 	o.TypedQuery = query
+	o.ScreenLine = query
 	if !o.Visible && len(o.Items) == 0 && o.LastGhostLen == 0 {
 		return ""
 	}
@@ -957,6 +996,7 @@ func (o *Overlay) HideMenu(query string) string {
 	clearLinesBelow(&s, clearRows())
 	// the box is gone, so nothing is hanging below a wrapped input any more
 	lastDrawnInputRows.Store(0)
+	o.hasAnchor = false
 	s.WriteString(ansi.SetModeAutoWrap)
 	return s.String()
 }
@@ -972,6 +1012,7 @@ func (o *Overlay) ClearAndDisable() string {
 	o.Visible = false
 	o.Items = nil
 	o.TypedQuery = ""
+	o.ScreenLine = ""
 	o.UserNavigated = false
 	o.Cursor = 0
 	o.StartIdx = 0
@@ -989,6 +1030,7 @@ func (o *Overlay) ClearAndDisable() string {
 	clearLinesBelow(&s, clearRows())
 	// the box is gone, so nothing is hanging below a wrapped input any more
 	lastDrawnInputRows.Store(0)
+	o.hasAnchor = false
 	s.WriteString(ansi.SetModeAutoWrap)
 	return s.String()
 }
