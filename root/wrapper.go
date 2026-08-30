@@ -791,11 +791,19 @@ func runWrapper() {
 			// app launched from a widget (atuin, fzf) has handed the screen back
 			isAltScreenActive.Store(false)
 
-			if overlay.GetUserNavigated() {
+			// iris is writing the line itself while the menu is being walked, so
+			// the shell is only echoing that back. The atomic flips before the
+			// rewrite goes out; the overlay's copy only catches up on the draw.
+			if userNavigated.Load() || overlay.GetUserNavigated() {
 				continue
 			}
 
-			if query == "" {
+			line, offset, ok := parseLineReport(query)
+			if !ok {
+				continue
+			}
+
+			if line == "" {
 				bufferMu.Lock()
 				wasEmpty := naiveBuffer == ""
 				naiveBuffer = ""
@@ -809,12 +817,13 @@ func runWrapper() {
 			}
 
 			bufferMu.Lock()
-			if naiveBuffer == query {
+			// the cursor alone moving still has to redraw, so it counts as a change
+			if naiveBuffer == line && cursorOffset == offset {
 				bufferMu.Unlock()
 				continue
 			}
-			naiveBuffer = query
-			cursorOffset = 0
+			naiveBuffer = line
+			cursorOffset = offset
 			bufferMu.Unlock()
 
 			if renderer, ok := renderOverlayFn.Load().(func()); ok {
@@ -925,7 +934,10 @@ func runWrapper() {
 
 		var b strings.Builder
 		if !navCopy {
-			if bufCopy == "" && !overlay.IsVisible() {
+			// bufCopy is only the text before the cursor. An empty one means the
+			// cursor sits at the start of a line that still has content, which
+			// is not the same as nothing being typed.
+			if queryForSearch == "" && !overlay.IsVisible() {
 				writeStdout([]byte(overlay.ClearAndDisable()))
 				return
 			}
@@ -1239,30 +1251,55 @@ func runWrapper() {
 						continue
 					}
 
+					// ctrl/alt + arrow is the shell's own word motion: forward it
+					// untouched and follow it, rather than falling through to
+					// the unknown-sequence path that drops the tracked line.
+					if motion, consumed := parseWordMotion(inputSlice[i:]); motion != motionNone {
+						intercepted = true
+						// the hint sits past the end of the line, so it has to be
+						// erased before the cursor leaves: blanking it afterwards
+						// lands on the text the cursor moved over
+						writeStdout([]byte(overlay.HideGhostTextSync()))
+						_, _ = ptmx.Write(inputSlice[i : i+consumed])
+						i += consumed - 1
+						bufferMu.Lock()
+						cursorOffset = wordMotionOffset(shellName, naiveBuffer, cursorOffset, motion)
+						hasLine := naiveBuffer != ""
+						bufferMu.Unlock()
+						if hasLine {
+							shouldOverlayDraw = true
+							userNavigated.Store(false)
+						}
+						continue
+					}
+
 					// handle escape sequences like arrow keys and functional shortcuts
 					// left/right arrow cursor tracking
 					isLeftRightArrow := false
 					if i+2 < n && (inputSlice[i+1] == '[' || inputSlice[i+1] == 'O') {
 						if inputSlice[i+2] == 'D' {
+							intercepted = true
+							rawSeq := append([]byte(nil), inputSlice[i:i+3]...)
+							i += 2
+
 							bufferMu.Lock()
 							isEmptyQuery := naiveBuffer == "" && (!overlay.IsVisible() || overlay.GetTypedQuery() == "")
 							bufferMu.Unlock()
 							if isEmptyQuery {
-								intercepted = true
-								i += 2
+								// nothing to track, but the shell may still have
+								// a line of its own to move through
+								_, _ = ptmx.Write(rawSeq)
 								continue
 							}
+
+							writeStdout([]byte(overlay.HideGhostTextSync()))
 							bufferMu.Lock()
-							if naiveBuffer != "" || overlay.IsVisible() {
-								cursorOffset++
-								if cursorOffset > len(naiveBuffer) {
-									cursorOffset = len(naiveBuffer)
-								}
-								shouldOverlayDraw = true
-								userNavigated.Store(false)
-							}
+							cursorOffset = min(cursorOffset+1, len([]rune(naiveBuffer)))
 							bufferMu.Unlock()
-							isLeftRightArrow = true
+							_, _ = ptmx.Write(rawSeq)
+							shouldOverlayDraw = true
+							userNavigated.Store(false)
+							continue
 						} else if inputSlice[i+2] == 'C' {
 							_, navConsumed := config.MatchKey(inputSlice[i:], config.Get().Keybindings.NavigateRight)
 							if navConsumed == 0 {
@@ -1295,6 +1332,7 @@ func runWrapper() {
 							isEmptyQuery := naiveBuffer == "" && (!overlay.IsVisible() || overlay.GetTypedQuery() == "")
 							bufferMu.Unlock()
 							if isEmptyQuery {
+								_, _ = ptmx.Write(rawSeq)
 								continue
 							}
 
