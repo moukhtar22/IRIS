@@ -46,6 +46,10 @@ type Adapter interface {
 	ScanAliases() map[string]string
 }
 
+type AbbrScanner interface {
+	ScanAbbrs() map[string]string
+}
+
 // Current shell instance
 var Current Adapter
 
@@ -147,11 +151,38 @@ func (f *FishAdapter) PrepareSelectSequence(selected string, cursorFromEnd int) 
 	return ReplaceLine([]byte(selected), cursorFromEnd)
 }
 func (f *FishAdapter) ScanAliases() map[string]string {
-	// fish uses 'alias' command in config.fish or separate function files
-	return ScanPosixAliases([]string{filepath.Join(GetFishConfigDir(), "config.fish")})
+	return scanFishDefs(GetFishConfigDir()).aliases
+}
+
+func (f *FishAdapter) ScanAbbrs() map[string]string {
+	return scanFishDefs(GetFishConfigDir()).abbrs
 }
 
 func GetFishConfigDir() string {
+	// $__fish_config_dir is a shell variable rather than an env var, so it is
+	// resolved once per process the same way ZDOTDIR is.
+	fishConfigDirOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "fish", "--no-config", "-c", "echo $__fish_config_dir")
+		out, err := cmd.Output()
+		if err == nil {
+			fishConfigDirCached = strings.TrimSpace(string(out))
+		}
+		if fishConfigDirCached == "" {
+			fishConfigDirCached = defaultFishConfigDir()
+		}
+	})
+
+	return fishConfigDirCached
+}
+
+var (
+	fishConfigDirOnce   sync.Once
+	fishConfigDirCached string
+)
+
+func defaultFishConfigDir() string {
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "fish")
 	}
@@ -223,8 +254,11 @@ func ScanPosixAliases(files []string) map[string]string {
 	aliases := make(map[string]string)
 	stamps := make(map[string]fileStamp)
 	visited := make(map[string]bool)
+	walk := func(data string, onSource func(target string)) {
+		walkShellConfig(data, aliases, onSource)
+	}
 	for _, path := range paths {
-		scanAliasFile(path, aliases, visited, stamps, 0)
+		scanConfigFile(path, walk, visited, stamps, 0)
 	}
 
 	aliasScanCache.entryPoints = paths
@@ -241,26 +275,35 @@ func cachedAliases(paths []string) map[string]string {
 	if aliasScanCache.aliases == nil || !slices.Equal(aliasScanCache.entryPoints, paths) {
 		return nil
 	}
-	for path, want := range aliasScanCache.stamps {
-		got, ok := statStamp(path)
-		if want == (fileStamp{}) {
-			// Was missing at scan time; it appearing is a change.
-			if ok {
-				return nil
-			}
-			continue
-		}
-		if !ok || got != want {
-			return nil
-		}
+	if !stampsUnchanged(aliasScanCache.stamps) {
+		return nil
 	}
 	return maps.Clone(aliasScanCache.aliases)
 }
 
-// scanAliasFile records the aliases defined in path, following any file it
-// sources. Most real configs keep aliases in a dedicated file pulled in with
-// `source`, so reading only the entry points would miss nearly all of them.
-func scanAliasFile(path string, aliases map[string]string, visited map[string]bool, stamps map[string]fileStamp, depth int) {
+func stampsUnchanged(stamps map[string]fileStamp) bool {
+	for path, want := range stamps {
+		got, ok := statStamp(path)
+		if want == (fileStamp{}) {
+			// Was missing at scan time; it appearing is a change.
+			if ok {
+				return false
+			}
+			continue
+		}
+		if !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+type configWalker func(data string, onSource func(target string))
+
+// scanConfigFile follows any file path sources. Most real configs keep aliases
+// in a dedicated file pulled in with `source`, so reading only the entry points
+// would miss nearly all of them.
+func scanConfigFile(path string, walk configWalker, visited map[string]bool, stamps map[string]fileStamp, depth int) {
 	if depth > maxSourceDepth {
 		return
 	}
@@ -287,8 +330,8 @@ func scanAliasFile(path string, aliases map[string]string, visited map[string]bo
 		return
 	}
 
-	walkShellConfig(string(data), aliases, func(target string) {
-		scanAliasFile(target, aliases, visited, stamps, depth+1)
+	walk(string(data), func(target string) {
+		scanConfigFile(target, walk, visited, stamps, depth+1)
 	})
 }
 
