@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [v0.7.0](https://github.com/versenilvis/iris/releases/tag/v0.7.0) - 2026-08-30
+
+### Bug fixes
+
+- Follow the shell's working directory in the watchdog process ([#143](https://github.com/versenilvis/iris/issues/143)) ([42416f](https://github.com/versenilvis/iris/commit/42416fc720d62e80696d839b66deffe8aa7c90d6))
+- Catch duplicate registrations; feat(cd): complete from zoxide ([#105](https://github.com/versenilvis/iris/issues/105)) ([2aa7df](https://github.com/versenilvis/iris/commit/2aa7df8e0ec7d15044608aa7cf7fff60597425b4))
+- Honor ui.max-height, unbreak select under backward-kill-line, free the arrow keys, symmetric scrolloff ([#104](https://github.com/versenilvis/iris/issues/104)) ([498a80](https://github.com/versenilvis/iris/commit/498a801dcd3333c911307a75388b45d7481694a4))
+- Move navigate-closed to core ([255404](https://github.com/versenilvis/iris/commit/255404832bebf2de2e1e53015923699d3d7ce9d8))
+- Unbreak the menu under atuin, wrapped commands, and max-height ([#147](https://github.com/versenilvis/iris/issues/147)) ([387bb7](https://github.com/versenilvis/iris/commit/387bb7f2417ff974fa736278934542d4e8e98830))
+- Keep the menu steady and intact while navigating history ([#148](https://github.com/versenilvis/iris/issues/148)) ([0deb70](https://github.com/versenilvis/iris/commit/0deb70ce6055550d9c6ae75d7600898822060fd2))
+- Parse fish aliases and abbreviations ([#154](https://github.com/versenilvis/iris/issues/154)) ([c57952](https://github.com/versenilvis/iris/commit/c5795236bbd0dfa77b37c0634357fd4f246653d8))
+
+### Features
+
+- Ghost-text as a 3-mode option, decoupled from the menu ([#115](https://github.com/versenilvis/iris/issues/115)) ([b4356e](https://github.com/versenilvis/iris/commit/b4356ee1d1662d6cfcf017a8109957f870d8d1af))
+- Follow `source` lines when scanning aliases ([#103](https://github.com/versenilvis/iris/issues/103)) ([83056b](https://github.com/versenilvis/iris/commit/83056ba063776e2b50f1e416fa67ae403e64e594))
+- Tui test ([#149](https://github.com/versenilvis/iris/issues/149)) ([c86c02](https://github.com/versenilvis/iris/commit/c86c0244cf6b02eb8f27482313aaf946c175366e))
+- Custom config/theme files  location ([#146](https://github.com/versenilvis/iris/issues/146)) ([2eafad](https://github.com/versenilvis/iris/commit/2eafad139274cc63670f872be9592c4f79089253))
+- Support ctrl arrow key natively ([#156](https://github.com/versenilvis/iris/issues/156)) ([b9450b](https://github.com/versenilvis/iris/commit/b9450ba914fa284c0b207d7a579f5b434a3f86c0))
+- Accept a percentage for ui.max-width ([#157](https://github.com/versenilvis/iris/issues/157)) ([53b287](https://github.com/versenilvis/iris/commit/53b287e20a880210ec39de4762de2a595f1d9ad9))
+
 ## [v0.6.3](https://github.com/versenilvis/iris/releases/tag/v0.6.3) - 2026-08-13
 
 ### Bug fixes
